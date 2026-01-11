@@ -25,12 +25,16 @@ def create_test_files(download_dir: str, num_panoramas: int = 3):
     download_dir.mkdir(parents=True, exist_ok=True)
     
     # Create a minimal download.txt with placeholder IDs
+    known_ids = [
+    "46qht4hVHHwGXyZTjA-ziQ"
+    ]
+
     download_txt = download_dir / 'download.txt'
     with open(download_txt, 'w') as f:
         for i in range(num_panoramas):
             # Replace these with real panorama IDs!
             # You can find panorama IDs using Google Street View or the panorama finder
-            f.write(f"PANORAMA_ID_{i+1}\n")
+            f.write(f"{known_ids[i]}\n")
     
     print(f"Created {download_txt}")
     print("⚠️  IMPORTANT: Replace the placeholder IDs with real panorama IDs!")

@@ -6,16 +6,31 @@ This replaces the streetview_panoid.html JavaScript tool with a Python implement
 
 import random
 import time
+import os
 import numpy as np
+from pathlib import Path
 from typing import List, Tuple, Optional
 
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    # Load .env from the streetview_dataset_tool directory (where this file is located)
+    _current_dir = Path(__file__).parent  # streetview_dataset_tool directory
+    
+    # Try loading .env from streetview_dataset_tool directory first, then current working directory
+    env_loaded = load_dotenv(_current_dir / '.env')  # Try streetview_dataset_tool/.env first
+    if not env_loaded:
+        load_dotenv('.env')  # Fallback to current working directory
+except ImportError:
+    # python-dotenv not installed, continue without it
+    pass
 
 def get_panorama_ids_google_api(location: Tuple[float, float], 
                                  radius: float = 0.012,
-                                 max_panoramas: int = 100,
-                                 api_key: Optional[str] = None) -> List[str]:
+                                 max_panoramas: int = 10,
+                                 api_key: Optional[str] = None) -> List[Tuple[str, float, float]]:
     """
-    Get panorama IDs using Google Street View Static API.
+    Get panorama IDs with GPS coordinates using Google Street View Metadata API.
     
     Note: This requires a Google API key and may have usage limits.
     
@@ -26,28 +41,34 @@ def get_panorama_ids_google_api(location: Tuple[float, float],
         api_key: Google Maps API key (optional, can use environment variable)
         
     Returns:
-        List of panorama IDs
+        List of tuples: (panorama_id, latitude, longitude)
     """
     try:
-        from googlemaps import Client
+        import requests
     except ImportError:
-        raise ImportError("googlemaps package required. Install with: pip install googlemaps")
-    
-    import os
+        raise ImportError("requests package required. Install with: pip install requests")
     
     if api_key is None:
-        api_key = os.environ.get('GOOGLE_MAPS_API_KEY')
+        api_key = os.getenv('GOOGLE_MAPS_API_KEY')
     
-    if api_key is None:
-        raise ValueError("Google Maps API key required. Set GOOGLE_MAPS_API_KEY environment variable or pass api_key parameter")
+    if api_key is None or api_key.strip() == '':
+        _current_dir = Path(__file__).parent
+        raise ValueError(
+            f"Google Maps API key required. "
+            f"Set GOOGLE_MAPS_API_KEY environment variable, add it to a .env file in {_current_dir}, "
+            f"or pass api_key parameter"
+        )
     
-    gmaps = Client(key=api_key)
-    panorama_ids = []
+    panorama_data = []
     seen_ids = set()
     
     lat, lng = location
     
-    for _ in range(max_panoramas * 10):  # Try more locations than needed
+    # Use Street View Metadata API to get panorama IDs with GPS coordinates
+    for attempt in range(max_panoramas * 10):  # Try more locations than needed
+        if len(panorama_data) >= max_panoramas:
+            break
+            
         # Random location within radius
         offset_lat = random.uniform(-radius, radius)
         offset_lng = random.uniform(-radius, radius) / abs(np.cos(np.radians(lat)))
@@ -56,22 +77,47 @@ def get_panorama_ids_google_api(location: Tuple[float, float],
         test_lng = lng + offset_lng
         
         try:
-            # Try to get panorama at this location
-            result = gmaps.streetview(
-                location=(test_lat, test_lng),
-                size=(640, 640)
-            )
+            # Query Street View Metadata API
+            url = "https://maps.googleapis.com/maps/api/streetview/metadata"
+            params = {
+                'location': f"{test_lat},{test_lng}",
+                'key': api_key
+            }
             
-            # Extract panorama ID from metadata
-            # Note: This is a simplified approach - actual implementation may vary
-            # depending on Google API response format
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            
+            if data['status'] == 'OK' and 'pano_id' in data:
+                pano_id = data['pano_id']
+                
+                # Skip if we've seen this panorama ID before
+                if pano_id in seen_ids:
+                    continue
+                
+                seen_ids.add(pano_id)
+                
+                # Get GPS coordinates from metadata
+                # Location is in format "lat,lng"
+                if 'location' in data:
+                    pano_lat = float(data['location']['lat'])
+                    pano_lng = float(data['location']['lng'])
+                else:
+                    # Fallback to search location if metadata doesn't have exact location
+                    pano_lat = test_lat
+                    pano_lng = test_lng
+                
+                panorama_data.append((pano_id, pano_lat, pano_lng))
+                print(f"Found panorama {len(panorama_data)}/{max_panoramas}: {pano_id} at ({pano_lat:.6f}, {pano_lng:.6f})")
             
             time.sleep(0.1)  # Rate limiting
             
         except Exception as e:
+            # Continue searching if this location doesn't have Street View
             continue
     
-    return list(seen_ids)
+    print(f"Found {len(panorama_data)} panoramas with GPS coordinates")
+    return panorama_data
 
 
 def get_panorama_ids_from_file(download_txt_path: str) -> List[str]:

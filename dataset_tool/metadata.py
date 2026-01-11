@@ -40,8 +40,8 @@ def create_dataset_metadata(cutout_dir, output_file, output_format='pickle'):
         city_name = city_dir.name
         print(f"Processing city: {city_name}")
         
-        # Get all image files
-        image_files = sorted([f for f in city_dir.glob('*.JPG') + city_dir.glob('*.jpg')])
+        # Get all image files (both uppercase and lowercase extensions)
+        image_files = sorted(list(city_dir.glob('*.JPG')) + list(city_dir.glob('*.jpg')))
         
         # Random seed based on city name for consistent train/test split
         random.seed(hash(city_name) % (2**32))

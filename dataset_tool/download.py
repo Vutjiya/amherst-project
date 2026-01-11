@@ -12,10 +12,62 @@ Tech. Rep. CTU–CMP–2011–16, Czech Tech Univ.
 
 import random
 import time
+import os
 import requests
 from io import BytesIO
+from pathlib import Path
 import numpy as np
 from PIL import Image
+
+# Load environment variables from .env file (if python-dotenv is available)
+try:
+    from dotenv import load_dotenv
+    # Load .env from the streetview_dataset_tool directory
+    _current_dir = Path(__file__).parent
+    load_dotenv(_current_dir / '.env')
+    load_dotenv('.env')  # Fallback to current working directory
+except ImportError:
+    # python-dotenv not installed, continue without it
+    pass
+
+
+def validate_panorama_id(panoid, api_key=None):
+    """
+    Validate if a panorama ID is still available using the Metadata API.
+    
+    Args:
+        panoid: Panorama ID to validate
+        api_key: Google Maps API key (optional, uses env var if not provided)
+        
+    Returns:
+        True if panorama is valid, False otherwise
+    """
+    import os
+    
+    if api_key is None:
+        api_key = os.getenv('GOOGLE_MAPS_API_KEY')
+    
+    if api_key is None:
+        # If no API key, skip validation (assume valid)
+        return True
+    
+    try:
+        # Use Metadata API to check if panorama exists
+        url = "https://maps.googleapis.com/maps/api/streetview/metadata"
+        params = {
+            'pano_id': panoid,
+            'key': api_key
+        }
+        
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        return data.get('status') == 'OK'
+        
+    except Exception:
+        # If validation fails, assume valid and let download attempt proceed
+        return True
 
 
 def fetch_tile(gzoom, i, j, panoid, server, max_retries=3, retry_delay=5):
@@ -41,10 +93,21 @@ def fetch_tile(gzoom, i, j, panoid, server, max_retries=3, retry_delay=5):
     for trial in range(max_retries):
         try:
             response = requests.get(url, timeout=10)
+            
+            # Check for 400 Bad Request specifically - panorama is invalid or not accessible
+            if response.status_code == 400:
+                if trial == 0:  # Only print once
+                    print(f"Warning: Panorama {panoid} is invalid or not accessible (400 Bad Request) - skipping")
+                return None
+            
             response.raise_for_status()
             
             # Load image
             img = Image.open(BytesIO(response.content))
+            
+            # Check if we got an error image (some invalid panoramas return placeholder images)
+            if img.size == (1, 1):
+                return None
             
             # Convert grayscale to RGB if needed
             if img.mode == 'L':
@@ -54,6 +117,17 @@ def fetch_tile(gzoom, i, j, panoid, server, max_retries=3, retry_delay=5):
             
             return img
             
+        except requests.exceptions.HTTPError as e:
+            if response.status_code == 400:
+                # Invalid panorama ID - don't retry
+                if trial == 0:
+                    print(f"Invalid panorama ID: {panoid} (400 Bad Request)")
+                return None
+            elif trial < max_retries - 1:
+                time.sleep(retry_delay)
+            else:
+                print(f"Failed to fetch tile ({i}, {j}) after {max_retries} attempts: {e}")
+                return None
         except Exception as e:
             if trial < max_retries - 1:
                 time.sleep(retry_delay)
@@ -64,7 +138,7 @@ def fetch_tile(gzoom, i, j, panoid, server, max_retries=3, retry_delay=5):
     return None
 
 
-def download_panorama(panoid, gzoom=4, use_random_server=True):
+def download_panorama(panoid, gzoom=4, use_random_server=True, validate_first=True):
     """
     Download a complete panorama by fetching and stitching tiles.
     
@@ -72,10 +146,19 @@ def download_panorama(panoid, gzoom=4, use_random_server=True):
         panoid: Panorama ID string
         gzoom: Zoom level (default 4, fallback to 3)
         use_random_server: Whether to randomize server selection
+        validate_first: Whether to validate panorama ID before downloading (requires API key)
         
     Returns:
         numpy array of panorama image (H, W, 3) as uint8, or None if failed
     """
+    # Optionally validate panorama ID first (requires API key)
+    if validate_first:
+        import os
+        api_key = os.getenv('GOOGLE_MAPS_API_KEY')
+        if api_key and not validate_panorama_id(panoid, api_key):
+            print(f"Skipping invalid panorama ID: {panoid}")
+            return None
+    
     # Randomize server selection (1-3)
     if use_random_server:
         server = random.randint(1, 3)
@@ -86,8 +169,16 @@ def download_panorama(panoid, gzoom=4, use_random_server=True):
     imtile = fetch_tile(gzoom, 0, 0, panoid, server)
     
     if imtile is None:
-        print(f"Panorama {panoid} not found at zoom level {gzoom}")
-        return None
+        # Try zoom level 3 as fallback
+        if gzoom == 4:
+            print(f"Panorama {panoid} not found at zoom level 4, trying zoom level 3...")
+            gzoom = 3
+            server = random.randint(1, 3) if use_random_server else 1
+            imtile = fetch_tile(gzoom, 0, 0, panoid, server)
+        
+        if imtile is None:
+            print(f"Panorama {panoid} not available (invalid ID or not accessible)")
+            return None
     
     # Define tile grid based on zoom level
     if gzoom == 3:
