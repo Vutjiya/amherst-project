@@ -87,7 +87,13 @@ def download_dataset(config: Config,
                     location: tuple = (42.3709, -72.5190),
                     radius: float = 0.06,
                     api_key: str = None,
-                    city_name: str = 'amherst'):
+                    city_name: str = 'amherst',
+                    downtown_center: tuple = None,
+                    distance_weight_power: float = 2.0,
+                    use_weighted_sampling: bool = True,
+                    use_osm_building_filter: bool = False,
+                    osm_max_distance_m: float = 30.0,
+                    osm_cache_dir: str = None):
     """
     Main function to download panoramas and extract cutouts.
     
@@ -98,6 +104,15 @@ def download_dataset(config: Config,
         location: (latitude, longitude) tuple for API search
         radius: Search radius in degrees for API search
         api_key: Google Maps API key (optional, can use environment variable)
+        city_name: Name of the city (used for savedir)
+        downtown_center: (latitude, longitude) tuple for downtown center for weighted sampling.
+                         If None, uses location as downtown center.
+        distance_weight_power: Power for distance weighting (default: 2.0).
+                               Higher values prioritize downtown more strongly.
+        use_weighted_sampling: If True, use distance-based weighted sampling (default: True).
+        use_osm_building_filter: If True, filter locations to only those near buildings from OSM.
+        osm_max_distance_m: Maximum distance in meters to consider "near" a building (default: 30.0).
+        osm_cache_dir: Directory path to cache OSM building data (optional).
     """
     # Validate configuration (mapping.txt still needed)
     if not config.mapping_txt.exists():
@@ -108,11 +123,25 @@ def download_dataset(config: Config,
     if location is None:
         raise ValueError("Location (latitude, longitude) required when using Google API")
     
+    # Default downtown center to location if not provided
+    if downtown_center is None:
+        downtown_center = location
+    
+    # Convert osm_cache_dir string to Path if provided
+    from pathlib import Path
+    osm_cache_path = Path(osm_cache_dir) if osm_cache_dir else None
+    
     panorama_data = get_panorama_ids_google_api(
         location=location,
         radius=radius,
         max_panoramas=max_panoramas or 100,
-        api_key=api_key
+        api_key=api_key,
+        downtown_center=downtown_center,
+        distance_weight_power=distance_weight_power,
+        use_weighted_sampling=use_weighted_sampling,
+        use_osm_building_filter=use_osm_building_filter,
+        osm_max_distance_m=osm_max_distance_m,
+        osm_cache_dir=osm_cache_path
     )
     
     if max_panoramas:
@@ -257,6 +286,42 @@ def main():
         default='paris',
         help='City name for savedir in mapping.txt (default: paris)'
     )
+    parser.add_argument(
+        '--downtown-center',
+        type=float,
+        nargs=2,
+        metavar=('LAT', 'LNG'),
+        default=None,
+        help='Downtown center for weighted sampling (default: uses --location as downtown center)'
+    )
+    parser.add_argument(
+        '--distance-weight-power',
+        type=float,
+        default=2.0,
+        help='Power for distance weighting. Higher values prioritize downtown more (default: 2.0)'
+    )
+    parser.add_argument(
+        '--no-weighted-sampling',
+        action='store_true',
+        help='Disable weighted sampling and use uniform random sampling instead'
+    )
+    parser.add_argument(
+        '--use-osm-building-filter',
+        action='store_true',
+        help='Enable OSM building footprint filtering (requires osmnx, geopandas, shapely, pyproj)'
+    )
+    parser.add_argument(
+        '--osm-max-distance-m',
+        type=float,
+        default=30.0,
+        help='Maximum distance in meters to consider "near" a building for OSM filtering (default: 30.0)'
+    )
+    parser.add_argument(
+        '--osm-cache-dir',
+        type=str,
+        default=None,
+        help='Directory to cache OSM building data (optional, speeds up subsequent runs)'
+    )
     
     args = parser.parse_args()
     
@@ -267,6 +332,9 @@ def main():
     )
     
     location_tuple = (args.location[0], args.location[1])
+    downtown_tuple = None
+    if args.downtown_center:
+        downtown_tuple = (args.downtown_center[0], args.downtown_center[1])
     
     download_dataset(
         config,
@@ -275,7 +343,13 @@ def main():
         location=location_tuple,
         radius=args.radius,
         api_key=args.api_key,
-        city_name=args.city_name
+        city_name=args.city_name,
+        downtown_center=downtown_tuple,
+        distance_weight_power=args.distance_weight_power,
+        use_weighted_sampling=not args.no_weighted_sampling,
+        use_osm_building_filter=args.use_osm_building_filter,
+        osm_max_distance_m=args.osm_max_distance_m,
+        osm_cache_dir=args.osm_cache_dir
     )
 
 

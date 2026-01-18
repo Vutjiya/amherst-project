@@ -8,3 +8,10 @@ python-dotenv>=0.19.0
 # Optional: For Google Maps API integration
 # googlemaps>=4.5.0
 
+# Optional: For OSM building footprint filtering (Solution 2)
+# Install with: pip install osmnx geopandas shapely pyproj
+# osmnx>=1.2.0
+# geopandas>=0.11.0
+# shapely>=2.0.0
+# pyproj>=3.4.0
+
