@@ -9,7 +9,7 @@ python3 -m dataset_tool.main \
     --city-name amherst \
     --radius 0.04 \
     --max-panoramas 10 \
-    --workers 4 \
+    --workers 8 \
     --use-osm-building-filter \
     --osm-max-distance-m 50.0 \
     --osm-cache-dir ./cache \

@@ -17,11 +17,14 @@ from .metadata import create_dataset_metadata
 from .panorama_finder import get_panorama_ids_google_api, parse_mapping_file
 from huggingface_hub import HfApi
 from PIL import Image
+import tempfile
+import os
+from collections import defaultdict
 
 api = HfApi()
 
 
-def generate_mapping_file(panorama_data, mapping_path, city_name='amherst', yaw_angles=[90.0, 270.0], pitch=-4.0):
+def generate_mapping_file(panorama_data, mapping_path, city_name='amherst', yaw_angles=[90.0, 270.0], pitch=10.0):
     """
     Generate mapping.txt file with GPS coordinates in filenames.
     
@@ -30,7 +33,7 @@ def generate_mapping_file(panorama_data, mapping_path, city_name='amherst', yaw_
         mapping_path: Path to output mapping.txt file
         city_name: Name of city (used as savedir)
         yaw_angles: List of yaw angles to extract (default: [90.0, 270.0] for east/west)
-        pitch: Pitch angle (default: -4.0)
+        pitch: Pitch angle (default: 10.0)
     """
     mapping_path = Path(mapping_path)
     mapping_path.parent.mkdir(parents=True, exist_ok=True)
@@ -86,32 +89,32 @@ def process_single_panorama(args):
         return (pano_idx, False, 0)
 
 
-def process_and_upload_panorama(args):
+def process_and_save_panorama(args):
     """
-    Process a single panorama and upload cutouts directly to Hugging Face (no disk storage).
+    Process a single panorama and save cutouts to temporary directory for batch upload.
     
     Args:
-        args: Tuple of (panoid, pano_idx, mappings, repo_id, repo_type, city_name)
+        args: Tuple of (panoid, pano_idx, mappings, temp_dir, city_name)
         
     Returns:
-        Tuple of (pano_idx, success, num_cutouts)
+        Tuple of (pano_idx, success, num_cutouts, list of (repo_path, file_path))
     """
-    panoid, pano_idx, mappings, repo_id, repo_type, city_name = args
+    panoid, pano_idx, mappings, temp_dir, city_name = args
     
     try:
         # Download panorama
         panorama = download_panorama(panoid)
         
         if panorama is None:
-            return (pano_idx, False, 0)
+            return (pano_idx, False, 0, [])
         
         # Filter mappings for this panorama
         pano_mappings = [m for m in mappings if m['Idx'] == pano_idx]
         
         if not pano_mappings:
-            return (pano_idx, True, 0)
+            return (pano_idx, True, 0, [])
         
-        uploaded = 0
+        cutout_files = []
         
         # Process each cutout
         for mapping in pano_mappings:
@@ -120,30 +123,25 @@ def process_and_upload_panorama(args):
             pitch = mapping['pitch']
             cutout = extract_cutout(panorama, yaw, pitch)
             
-            # Convert to JPEG bytes in memory
+            # Convert to JPEG and save to temp directory
             img = Image.fromarray(cutout)
-            img_bytes = BytesIO()
-            img.save(img_bytes, format='JPEG', quality=95)
-            img_bytes.seek(0)
             
-            # Construct path in repo (e.g., "amherst/42.335999_-72.584693_90.0_-4.0.JPG")
+            # Construct paths
             repo_path = f"{city_name}/{mapping['fname']}"
+            file_path = os.path.join(temp_dir, repo_path)
             
-            # Upload directly to Hugging Face
-            api.upload_file(
-                path_or_fileobj=img_bytes,
-                path_in_repo=repo_path,
-                repo_id=repo_id,
-                repo_type=repo_type,
-            )
+            # Create directory if needed
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
             
-            uploaded += 1
+            # Save to temp directory
+            img.save(file_path, 'JPEG', quality=95)
+            cutout_files.append((repo_path, file_path))
         
-        return (pano_idx, True, uploaded)
+        return (pano_idx, True, len(cutout_files), cutout_files)
         
     except Exception as e:
         print(f"Error processing panorama {pano_idx} ({panoid}): {e}")
-        return (pano_idx, False, 0)
+        return (pano_idx, False, 0, [])
 
 
 def download_dataset(config: Config, 
@@ -239,12 +237,19 @@ def download_dataset(config: Config,
     # Extract panorama IDs from panorama_data tuples
     panorama_ids = [pano[0] for pano in panorama_data]
     
+    # Initialize temp_dir for batch uploads (if needed)
+    temp_dir = None
+    
     args_list = []
     if upload_to_hf:
-        # Streaming upload mode: upload directly to Hugging Face
+        # Batch upload mode: save to temp directory, then upload in batches
         if not hf_repo_id:
             raise ValueError("hf_repo_id required when upload_to_hf=True")
-        print(f"Streaming mode: Uploading directly to {hf_repo_id} (no disk storage)")
+        print(f"Batch upload mode: Processing panoramas and uploading in batches to {hf_repo_id}")
+        
+        # Create temporary directory for batch uploads
+        temp_dir = tempfile.mkdtemp(prefix='hf_upload_')
+        print(f"Using temporary directory: {temp_dir}")
         
         for idx, panoid in enumerate(panorama_ids):
             if idx in mappings_by_pano:
@@ -252,12 +257,11 @@ def download_dataset(config: Config,
                     panoid,
                     idx,
                     mappings,  # Pass full mappings list
-                    hf_repo_id,
-                    hf_repo_type,
+                    temp_dir,
                     city_name
                 ))
         
-        process_func = process_and_upload_panorama
+        process_func = process_and_save_panorama
     else:
         # Standard mode: save to disk
         for idx, panoid in enumerate(panorama_ids):
@@ -292,16 +296,49 @@ def download_dataset(config: Config,
             ))
     
     # Summary
-    successful = sum(1 for _, success, _ in results if success)
-    total_cutouts = sum(num for _, _, num in results)
+    if upload_to_hf:
+        successful = sum(1 for _, success, _, _ in results if success)
+        total_cutouts = sum(num for _, _, num, _ in results)
+    else:
+        successful = sum(1 for _, success, _ in results if success)
+        total_cutouts = sum(num for _, _, num in results)
     failed = len(args_list) - successful
     
-    print(f"\nCompleted:")
+    print(f"\nCompleted processing:")
     print(f"  Successful panoramas: {successful}/{len(args_list)}")
     if failed > 0:
         print(f"  Failed panoramas: {failed} (invalid IDs or not accessible)")
+    
+    # Batch upload to Hugging Face if needed
     if upload_to_hf:
-        print(f"  Total cutouts uploaded to Hugging Face: {total_cutouts}")
+        print(f"\nUploading {total_cutouts} cutouts to Hugging Face...")
+        
+        # All files are already in temp_dir with correct structure
+        # Upload the entire folder in one commit (avoids rate limits)
+        try:
+            print(f"  Uploading folder to {hf_repo_id}...")
+            api.upload_folder(
+                folder_path=temp_dir,
+                repo_id=hf_repo_id,
+                repo_type=hf_repo_type,
+                commit_message=f"Upload {total_cutouts} cutouts from {city_name}"
+            )
+            print(f"  ✓ Successfully uploaded {total_cutouts} cutouts in a single commit")
+        except Exception as e:
+            print(f"  ✗ Error uploading to Hugging Face: {e}")
+            print(f"  Files are still in: {temp_dir}")
+            raise
+        
+        # Clean up temporary directory
+        import shutil
+        try:
+            shutil.rmtree(temp_dir)
+            print(f"  Cleaned up temporary directory")
+        except Exception as e:
+            print(f"  Warning: Could not clean up temp directory {temp_dir}: {e}")
+        
+        print(f"\nUpload complete!")
+        print(f"  Total cutouts uploaded: {total_cutouts}")
     else:
         print(f"  Total cutouts extracted: {total_cutouts}")
     
@@ -482,27 +519,5 @@ def main():
 
 
 if __name__ == '__main__':
-    # Test upload to Hugging Face
-    # repo_id = 'jonathanliu72/amherst-dataset'
-    # repo_type = 'dataset'
-    # folder_path = './dataset_tool/test_cutouts'
-    
-    # try:
-    #     print(f"Uploading {folder_path} to {repo_id}...")
-    #     api.upload_folder(
-    #         folder_path=folder_path,
-    #         repo_id=repo_id,
-    #         repo_type=repo_type,
-    #     )
-    #     print(f"Successfully uploaded to {repo_id}!")
-        
-    # except Exception as e:
-    #     print(f"Error uploading to Hugging Face: {e}")
-    #     print("\nTroubleshooting:")
-    #     print("1. Make sure you're authenticated: huggingface-cli login")
-    #     print("2. Or set HUGGINGFACE_HUB_TOKEN environment variable")
-    #     print("3. Check that the folder path exists and contains files")
-    #     raise
-    
     main()
 
