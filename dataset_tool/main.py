@@ -5,6 +5,7 @@ This is the Python equivalent of streetview_download.m
 """
 
 import argparse
+import time
 from pathlib import Path
 from tqdm import tqdm
 from multiprocessing import Pool, cpu_count
@@ -15,13 +16,7 @@ from .download import download_panorama
 from .extract import extract_cutouts_from_panorama, extract_cutout
 from .metadata import create_dataset_metadata
 from .panorama_finder import get_panorama_ids_google_api, parse_mapping_file
-from huggingface_hub import HfApi
 from PIL import Image
-import tempfile
-import os
-from collections import defaultdict
-
-api = HfApi()
 
 
 def generate_mapping_file(panorama_data, mapping_path, city_name='amherst', yaw_angles=[90.0, 270.0], pitch=10.0):
@@ -63,12 +58,12 @@ def process_single_panorama(args):
     Process a single panorama: download and extract cutouts.
     
     Args:
-        args: Tuple of (panoid, pano_idx, mappings, cutout_folder)
+        args: Tuple of (panoid, pano_idx, mappings, cutout_folder, delay_seconds)
         
     Returns:
         Tuple of (pano_idx, success, num_cutouts)
     """
-    panoid, pano_idx, mappings, cutout_folder = args
+    panoid, pano_idx, mappings, cutout_folder, delay_seconds = args
     
     try:
         # Download panorama
@@ -82,6 +77,10 @@ def process_single_panorama(args):
             panorama, pano_idx, mappings, cutout_folder
         )
         
+        # Add delay after processing to avoid rate limiting
+        if delay_seconds > 0:
+            time.sleep(delay_seconds)
+        
         return (pano_idx, True, num_cutouts)
         
     except Exception as e:
@@ -89,59 +88,6 @@ def process_single_panorama(args):
         return (pano_idx, False, 0)
 
 
-def process_and_save_panorama(args):
-    """
-    Process a single panorama and save cutouts to temporary directory for batch upload.
-    
-    Args:
-        args: Tuple of (panoid, pano_idx, mappings, temp_dir, city_name)
-        
-    Returns:
-        Tuple of (pano_idx, success, num_cutouts, list of (repo_path, file_path))
-    """
-    panoid, pano_idx, mappings, temp_dir, city_name = args
-    
-    try:
-        # Download panorama
-        panorama = download_panorama(panoid)
-        
-        if panorama is None:
-            return (pano_idx, False, 0, [])
-        
-        # Filter mappings for this panorama
-        pano_mappings = [m for m in mappings if m['Idx'] == pano_idx]
-        
-        if not pano_mappings:
-            return (pano_idx, True, 0, [])
-        
-        cutout_files = []
-        
-        # Process each cutout
-        for mapping in pano_mappings:
-            # Extract cutout
-            yaw = mapping['yawRel']
-            pitch = mapping['pitch']
-            cutout = extract_cutout(panorama, yaw, pitch)
-            
-            # Convert to JPEG and save to temp directory
-            img = Image.fromarray(cutout)
-            
-            # Construct paths
-            repo_path = f"{city_name}/{mapping['fname']}"
-            file_path = os.path.join(temp_dir, repo_path)
-            
-            # Create directory if needed
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
-            
-            # Save to temp directory
-            img.save(file_path, 'JPEG', quality=95)
-            cutout_files.append((repo_path, file_path))
-        
-        return (pano_idx, True, len(cutout_files), cutout_files)
-        
-    except Exception as e:
-        print(f"Error processing panorama {pano_idx} ({panoid}): {e}")
-        return (pano_idx, False, 0, [])
 
 
 def download_dataset(config: Config, 
@@ -157,9 +103,9 @@ def download_dataset(config: Config,
                     use_osm_building_filter: bool = False,
                     osm_max_distance_m: float = 30.0,
                     osm_cache_dir: str = None,
-                    upload_to_hf: bool = False,
-                    hf_repo_id: str = None,
-                    hf_repo_type: str = 'dataset'):
+                    delay_between_panoramas: float = 0.1,
+                    skip_metadata: bool = False,
+                    ):
     """
     Main function to download panoramas and extract cutouts.
     
@@ -179,11 +125,9 @@ def download_dataset(config: Config,
         use_osm_building_filter: If True, filter locations to only those near buildings from OSM.
         osm_max_distance_m: Maximum distance in meters to consider "near" a building (default: 30.0).
         osm_cache_dir: Directory path to cache OSM building data (optional).
+        delay_between_panoramas: Delay in seconds between processing panoramas to avoid rate limiting (default: 0.1).
+        skip_metadata: If True, skip creating metadata file (default: False).
     """
-    # Validate configuration (mapping.txt still needed)
-    if not config.mapping_txt.exists():
-        raise FileNotFoundError(f"mapping.txt not found: {config.mapping_txt}")
-    
     # Get panorama IDs with GPS coordinates using Google API
     print("Fetching panorama IDs from Google Street View API...")
     if location is None:
@@ -237,43 +181,20 @@ def download_dataset(config: Config,
     # Extract panorama IDs from panorama_data tuples
     panorama_ids = [pano[0] for pano in panorama_data]
     
-    # Initialize temp_dir for batch uploads (if needed)
-    temp_dir = None
-    
+    # Prepare arguments for parallel processing
+    # Always save to local directory
     args_list = []
-    if upload_to_hf:
-        # Batch upload mode: save to temp directory, then upload in batches
-        if not hf_repo_id:
-            raise ValueError("hf_repo_id required when upload_to_hf=True")
-        print(f"Batch upload mode: Processing panoramas and uploading in batches to {hf_repo_id}")
-        
-        # Create temporary directory for batch uploads
-        temp_dir = tempfile.mkdtemp(prefix='hf_upload_')
-        print(f"Using temporary directory: {temp_dir}")
-        
-        for idx, panoid in enumerate(panorama_ids):
-            if idx in mappings_by_pano:
-                args_list.append((
-                    panoid,
-                    idx,
-                    mappings,  # Pass full mappings list
-                    temp_dir,
-                    city_name
-                ))
-        
-        process_func = process_and_save_panorama
-    else:
-        # Standard mode: save to disk
-        for idx, panoid in enumerate(panorama_ids):
-            if idx in mappings_by_pano:
-                args_list.append((
-                    panoid,
-                    idx,
-                    mappings_by_pano[idx],
-                    str(config.cutout_dir)
-                ))
-        
-        process_func = process_single_panorama
+    for idx, panoid in enumerate(panorama_ids):
+        if idx in mappings_by_pano:
+            args_list.append((
+                panoid,
+                idx,
+                mappings_by_pano[idx],
+                str(config.cutout_dir),
+                delay_between_panoramas
+            ))
+    
+    process_func = process_single_panorama
     
     # Process panoramas
     if num_workers is None:
@@ -296,54 +217,18 @@ def download_dataset(config: Config,
             ))
     
     # Summary
-    if upload_to_hf:
-        successful = sum(1 for _, success, _, _ in results if success)
-        total_cutouts = sum(num for _, _, num, _ in results)
-    else:
-        successful = sum(1 for _, success, _ in results if success)
-        total_cutouts = sum(num for _, _, num in results)
+    successful = sum(1 for _, success, _ in results if success)
+    total_cutouts = sum(num for _, _, num in results)
     failed = len(args_list) - successful
     
-    print(f"\nCompleted processing:")
+    print(f"\nCompleted:")
     print(f"  Successful panoramas: {successful}/{len(args_list)}")
     if failed > 0:
         print(f"  Failed panoramas: {failed} (invalid IDs or not accessible)")
+    print(f"  Total cutouts extracted: {total_cutouts}")
     
-    # Batch upload to Hugging Face if needed
-    if upload_to_hf:
-        print(f"\nUploading {total_cutouts} cutouts to Hugging Face...")
-        
-        # All files are already in temp_dir with correct structure
-        # Upload the entire folder in one commit (avoids rate limits)
-        try:
-            print(f"  Uploading folder to {hf_repo_id}...")
-            api.upload_folder(
-                folder_path=temp_dir,
-                repo_id=hf_repo_id,
-                repo_type=hf_repo_type,
-                commit_message=f"Upload {total_cutouts} cutouts from {city_name}"
-            )
-            print(f"  ✓ Successfully uploaded {total_cutouts} cutouts in a single commit")
-        except Exception as e:
-            print(f"  ✗ Error uploading to Hugging Face: {e}")
-            print(f"  Files are still in: {temp_dir}")
-            raise
-        
-        # Clean up temporary directory
-        import shutil
-        try:
-            shutil.rmtree(temp_dir)
-            print(f"  Cleaned up temporary directory")
-        except Exception as e:
-            print(f"  Warning: Could not clean up temp directory {temp_dir}: {e}")
-        
-        print(f"\nUpload complete!")
-        print(f"  Total cutouts uploaded: {total_cutouts}")
-    else:
-        print(f"  Total cutouts extracted: {total_cutouts}")
-    
-    # Create metadata file (only if not streaming)
-    if not upload_to_hf:
+    # Create metadata file (unless skipped)
+    if not skip_metadata:
         print("\nCreating dataset metadata...")
         create_dataset_metadata(
             str(config.cutout_dir),
@@ -355,9 +240,9 @@ def download_dataset(config: Config,
         print(f"  Cutouts: {config.cutout_dir}")
         print(f"  Metadata: {config.dataset_path}")
     else:
-        print(f"\nDataset upload complete!")
-        print(f"  Repository: {hf_repo_id}")
-        print(f"  Total cutouts: {total_cutouts}")
+        print(f"\nDataset creation complete!")
+        print(f"  Cutouts: {config.cutout_dir}")
+        print(f"  Metadata: Skipped (use extract_town_metadata.py to create town-specific metadata)")
 
 
 def main():
@@ -374,8 +259,8 @@ def main():
     parser.add_argument(
         '--cutout-dir',
         type=str,
-        required=False,
-        help='Directory where cutouts will be saved (not needed if --upload-to-hf is set)'
+        required=True,
+        help='Directory where cutouts will be saved'
     )
     parser.add_argument(
         '--dataset-name',
@@ -458,38 +343,26 @@ def main():
         help='Directory to cache OSM building data (optional, speeds up subsequent runs)'
     )
     parser.add_argument(
-        '--upload-to-hf',
+        '--delay-between-panoramas',
+        type=float,
+        default=0.1,
+        help='Delay in seconds between processing panoramas to avoid rate limiting (default: 0.1). Set to 0 to disable.'
+    )
+    parser.add_argument(
+        '--skip-metadata',
         action='store_true',
-        help='Upload cutouts directly to Hugging Face (no disk storage). Requires --hf-repo-id'
-    )
-    parser.add_argument(
-        '--hf-repo-id',
-        type=str,
-        default=None,
-        help='Hugging Face repository ID (e.g., "username/dataset-name"). Required if --upload-to-hf is set'
-    )
-    parser.add_argument(
-        '--hf-repo-type',
-        type=str,
-        default='dataset',
-        choices=['dataset', 'model', 'space'],
-        help='Hugging Face repository type (default: dataset)'
+        help='Skip creating metadata file (useful when creating town-specific metadata separately)'
     )
     
     args = parser.parse_args()
     
     # Validate arguments
-    if args.upload_to_hf and not args.hf_repo_id:
-        parser.error("--hf-repo-id is required when --upload-to-hf is set")
-    if not args.upload_to_hf and not args.cutout_dir:
-        parser.error("--cutout-dir is required when not using --upload-to-hf")
-    
-    # Use a dummy cutout_dir if uploading to HF (won't be used)
-    cutout_dir = args.cutout_dir or './dummy_cutouts'
+    if not args.cutout_dir:
+        parser.error("--cutout-dir is required")
     
     config = Config(
         download_dir=args.download_dir,
-        cutout_dir=cutout_dir,
+        cutout_dir=args.cutout_dir,
         dataset_name=args.dataset_name
     )
     
@@ -512,9 +385,8 @@ def main():
         use_osm_building_filter=args.use_osm_building_filter,
         osm_max_distance_m=args.osm_max_distance_m,
         osm_cache_dir=args.osm_cache_dir,
-        upload_to_hf=args.upload_to_hf,
-        hf_repo_id=args.hf_repo_id,
-        hf_repo_type=args.hf_repo_type
+        delay_between_panoramas=args.delay_between_panoramas,
+        skip_metadata=args.skip_metadata
     )
 
 

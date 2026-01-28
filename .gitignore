@@ -10,3 +10,10 @@ wheels/
 .venv
 
 **/.DS_Store
+
+# Dataset outputs (cutouts and mappings)
+data/cutouts/
+data/test_data/
+
+# Markdown docs
+*.md
